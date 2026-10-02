@@ -1,8 +1,8 @@
 """Detect and track the staff member in a 3D-sensor video.
 
 The detector finds people with YOLO and uses appearance similarity against
-reference snapshots to identify the staff member. It produces an annotated
-video and one CSV row per input frame.
+the tagged-shirt reference snapshot to identify the single staff member.
+It produces an annotated video and one CSV row per input frame.
 """
 
 from __future__ import annotations
@@ -35,21 +35,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--match-threshold",
         type=float,
-        default=0.42,
+        default=0.60,
         help="Appearance similarity threshold from 0 to 1.",
     )
     parser.add_argument(
         "--stable-frames",
         type=int,
-        default=3,
+        default=8,
         help="Consecutive matching frames required before staff_present is true.",
+    )
+    parser.add_argument(
+        "--minimum-movement",
+        type=float,
+        default=35.0,
+        help="Minimum recent center movement in pixels for a staff candidate.",
     )
     return parser.parse_args()
 
 
 def default_references() -> list[Path]:
     reference_dir = Path("sample/reference_images")
-    return sorted(reference_dir.glob("page_1_image_[23].jpg"))
+    return [
+        reference_dir / "page_1_image_2.jpg",
+        reference_dir / "page_1_image_3.jpg",
+    ]
 
 
 def make_histogram(cv2, image):
@@ -71,6 +80,16 @@ def appearance_score(cv2, crop, reference: Reference) -> float:
         255.0 * (96 * 160) ** 0.5
     )
     return max(0.0, min(1.0, 0.65 * ((histogram_score + 1.0) / 2.0) + 0.35 * pixel_score))
+
+
+def torso_crop(cv2, person_crop):
+    """Return the upper torso, where the staff tag is visible."""
+    height, width = person_crop.shape[:2]
+    top = int(height * 0.18)
+    bottom = int(height * 0.72)
+    left = int(width * 0.15)
+    right = int(width * 0.85)
+    return person_crop[top:bottom, left:right]
 
 
 def load_references(cv2, paths: list[Path]) -> list[Reference]:
@@ -107,22 +126,29 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_video = args.output_dir / "annotated.mp4"
-    output_avi = args.output_dir / "annotated.avi"
     output_csv = args.output_dir / "staff_frames.csv"
     writer = cv2.VideoWriter(
         str(output_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
     )
-    compatible_writer = cv2.VideoWriter(
-        str(output_avi), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height)
-    )
-    if not writer.isOpened() or not compatible_writer.isOpened():
-        raise RuntimeError("Could not create output video writers")
+    if not writer.isOpened():
+        raise RuntimeError("Could not create MP4 output video")
     model = YOLO(args.model)
-    stable_count = 0
+    track_stability: dict[int, int] = {}
+    track_positions: dict[int, tuple[float, float]] = {}
+    track_movement: dict[int, float] = {}
 
     with output_csv.open("w", newline="", encoding="utf-8") as csv_file:
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["frame_number", "timestamp_seconds", "staff_present", "x", "y", "score"])
+        csv_writer.writerow([
+            "frame_number",
+            "timestamp_seconds",
+            "staff_present",
+            "staff_count",
+            "track_id",
+            "x",
+            "y",
+            "score",
+        ])
 
         frame_number = 0
         while True:
@@ -138,39 +164,69 @@ def main() -> None:
                 verbose=False,
             )[0]
 
-            best = None
+            candidates = []
             if result.boxes is not None:
-                for box in result.boxes.xyxy.int().cpu().tolist():
+                boxes = result.boxes.xyxy.int().cpu().tolist()
+                ids = result.boxes.id.int().cpu().tolist() if result.boxes.id is not None else list(range(len(boxes)))
+                for track_id, box in zip(ids, boxes):
                     left, top, right, bottom = box
                     left, top = max(0, left), max(0, top)
                     right, bottom = min(width, right), min(height, bottom)
                     if right <= left or bottom <= top:
                         continue
-                    crop = frame[top:bottom, left:right]
+                    crop = torso_crop(cv2, frame[top:bottom, left:right])
                     score = max(appearance_score(cv2, crop, ref) for ref in references)
-                    if best is None or score > best[0]:
-                        best = (score, left, top, right, bottom)
+                    center = ((left + right) / 2, (top + bottom) / 2)
+                    track_id = int(track_id)
+                    previous_center = track_positions.get(track_id)
+                    movement = 0.0
+                    if previous_center is not None:
+                        movement = ((center[0] - previous_center[0]) ** 2 + (center[1] - previous_center[1]) ** 2) ** 0.5
+                    track_positions[track_id] = center
+                    track_movement[track_id] = min(500.0, track_movement.get(track_id, 0.0) * 0.85 + movement)
+                    candidates.append((track_id, score, left, top, right, bottom))
 
-            is_match = best is not None and best[0] >= args.match_threshold
-            stable_count = stable_count + 1 if is_match else 0
-            staff_present = stable_count >= args.stable_frames
-            x = y = ""
-            if staff_present and best is not None:
-                _, left, top, right, bottom = best
+            for track_id, score, *_ in candidates:
+                if score >= args.match_threshold:
+                    track_stability[track_id] = track_stability.get(track_id, 0) + 1
+                else:
+                    track_stability[track_id] = max(0, track_stability.get(track_id, 0) - 1)
+
+            staff_candidates = [
+                candidate for candidate in candidates
+                if candidate[1] >= args.match_threshold
+                and track_stability.get(candidate[0], 0) >= args.stable_frames
+                and track_movement.get(candidate[0], 0.0) >= args.minimum_movement
+            ]
+            staff = max(staff_candidates, key=lambda candidate: candidate[1], default=None)
+            staff_present = staff is not None
+            if staff is not None:
+                track_id, score, left, top, right, bottom = staff
                 x, y = round((left + right) / 2, 1), round((top + bottom) / 2, 1)
                 cv2.rectangle(frame, (left, top), (right, bottom), (0, 220, 0), 2)
-                cv2.putText(frame, f"STAFF {best[0]:.2f}", (left, max(20, top - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 0), 2)
+                cv2.putText(frame, f"STAFF #{track_id} {score:.2f}", (left, max(20, top - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 0), 2)
 
-            csv_writer.writerow([frame_number, round(frame_number / fps, 3), int(staff_present), x, y, round(best[0], 3) if best else ""])
+            timestamp = round(frame_number / fps, 3)
+            if staff is not None:
+                track_id, score, left, top, right, bottom = staff
+                csv_writer.writerow([
+                    frame_number,
+                    timestamp,
+                    1,
+                    1,
+                    track_id,
+                    round((left + right) / 2, 1),
+                    round((top + bottom) / 2, 1),
+                    round(score, 3),
+                ])
+            else:
+                csv_writer.writerow([frame_number, timestamp, 0, 0, "", "", "", ""])
             writer.write(frame)
-            compatible_writer.write(frame)
             frame_number += 1
 
     capture.release()
     writer.release()
-    compatible_writer.release()
     print(f"Wrote {frame_number} frames to {output_video}")
-    print(f"Wrote compatibility video to {output_avi}")
     print(f"Wrote frame results to {output_csv}")
 
 
